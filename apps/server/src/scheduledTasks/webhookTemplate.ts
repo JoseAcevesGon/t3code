@@ -151,7 +151,7 @@ export function renderWebhookPrompt(
     const expression = rawExpression.trim();
     const value = resolve(expression);
     const text = value === undefined || value === null ? undefined : stringify(value);
-    if (text === undefined) {
+    if (text === undefined || (raw && text === "")) {
       if (!missing.includes(expression)) missing.push(expression);
       return "";
     }

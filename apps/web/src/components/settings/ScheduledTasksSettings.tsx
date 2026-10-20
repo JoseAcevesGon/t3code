@@ -730,7 +730,7 @@ function WebhookDeliveriesDialog({
       ? null
       : serverEnvironment.scheduledTaskWebhookDelivery({
           environmentId,
-          input: { id: task.id, deliveryId: selectedId },
+          input: { id: task.id, deliveryId: selectedId, acceptAnyOutcome: true },
         }),
   );
   const deliveries = deliveriesQuery.data?.deliveries ?? null;

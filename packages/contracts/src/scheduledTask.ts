@@ -323,6 +323,7 @@ export type ScheduledTaskListWebhookDeliveriesResult =
 export const ScheduledTaskGetWebhookDeliveryInput = Schema.Struct({
   id: ScheduledTaskId,
   deliveryId: ScheduledTaskWebhookDeliveryId,
+  acceptAnyOutcome: Schema.optional(Schema.Boolean),
 });
 export type ScheduledTaskGetWebhookDeliveryInput = typeof ScheduledTaskGetWebhookDeliveryInput.Type;
 
