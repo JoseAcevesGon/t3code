@@ -39,6 +39,21 @@ describe("scheduleDraftForTask", () => {
     const draft = scheduleDraftForTask({ schedule: { type: "webhook", signature: null, dedupe } });
     expect(scheduleFromDraft(draft)).toMatchObject({ dedupe });
     expect(
+      scheduleFromDraft({
+        ...draft,
+        replayKey: " \n ",
+        coalesceKey: " \t ",
+        coalesceWindowSeconds: "",
+      }),
+    ).toMatchObject({ dedupe: {} });
+    expect(
+      scheduleFromDraft({
+        ...draft,
+        replayKey: `  ${dedupe.replayKey}  `,
+        coalesceKey: `\t${dedupe.coalesceKey}\n`,
+      }),
+    ).toMatchObject({ dedupe });
+    expect(
       scheduleFromDraft({ ...draft, replayKey: "", coalesceKey: "", coalesceWindowSeconds: "" }),
     ).toMatchObject({ dedupe: {} });
     for (const coalesceWindowSeconds of ["9", "3601", "1.5", "abc"]) {

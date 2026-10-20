@@ -187,6 +187,21 @@ describe("webhook scheduled tasks", () => {
     });
     expect(scheduleFromDraft(draft)).toMatchObject({ dedupe });
     expect(
+      scheduleFromDraft({
+        ...draft,
+        replayKey: " \n ",
+        coalesceKey: " \t ",
+        coalesceWindowSeconds: "",
+      }),
+    ).toMatchObject({ dedupe: {} });
+    expect(
+      scheduleFromDraft({
+        ...draft,
+        replayKey: `  ${dedupe.replayKey}  `,
+        coalesceKey: `\t${dedupe.coalesceKey}\n`,
+      }),
+    ).toMatchObject({ dedupe });
+    expect(
       scheduleFromDraft({ ...draft, replayKey: "", coalesceKey: "", coalesceWindowSeconds: "" }),
     ).toMatchObject({ dedupe: {} });
     expect(scheduleFromDraft({ ...draft, coalesceWindowSeconds: "" })).toMatchObject({

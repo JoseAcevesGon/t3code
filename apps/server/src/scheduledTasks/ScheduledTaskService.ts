@@ -678,9 +678,10 @@ export const layer = Layer.effect(
     // markCompleted, write a full terminal record so runDueTasks neither skips
     // the task forever (it filters out 'running' rows) nor re-fires it
     // immediately: the dispatch may already have gone out, so next_run_at must
-    // advance and run_count must count the attempt.
+    // advance. Pending webhook attempts count only with their completion ledger;
+    // other attempts count here.
     const releaseStuckRun = Effect.fn("ScheduledTaskService.releaseStuckRun")(
-      function* (task: ScheduledTask, message: string) {
+      function* (task: ScheduledTask, message: string, pendingDeliveryId?: string) {
         const now = yield* localNow;
         const reread = yield* Effect.result(findTask(task.id));
         if (Result.isSuccess(reread) && reread.success === null) return;
@@ -691,12 +692,15 @@ export const layer = Layer.effect(
               last_run_error = ${message},
               next_run_at = ${nextRunAt(source, now)},
               updated_at = ${iso(now)},
-              run_count = run_count + 1
+              run_count = run_count + CASE WHEN EXISTS (
+                SELECT 1 FROM scheduled_task_webhook_pending
+                WHERE delivery_id = ${pendingDeliveryId ?? null} AND state = 'running'
+              ) THEN 0 ELSE 1 END
           WHERE task_id = ${task.id} AND last_run_status = 'running'
         `;
         yield* notifyChanged;
       },
-      (effect, task, _message) =>
+      (effect, task, _message, _pendingDeliveryId) =>
         effect.pipe(
           Effect.catch((cause) =>
             Effect.logWarning("Could not release stuck schedule task run", {
@@ -710,7 +714,11 @@ export const layer = Layer.effect(
     const runTask = Effect.fn("ScheduledTaskService.runTask")(function* (
       task: ScheduledTask,
       trigger: "scheduled" | "manual" | "webhook",
-      webhook?: { readonly deliveryId: string; readonly prompt: string },
+      webhook?: {
+        readonly deliveryId: string;
+        readonly prompt: string;
+        readonly dispatched: Ref.Ref<boolean>;
+      },
     ) {
       const reserved = yield* Ref.modify(activeRuns, (active) => {
         if (active.has(task.id)) return [false, active] as const;
@@ -775,7 +783,22 @@ export const layer = Layer.effect(
           if (reason !== null) return yield* new WebhookDeliverySkipped({ reason });
         }
 
-        yield* markRunning(active.id, startedAtIso);
+        if (webhook === undefined) yield* markRunning(active.id, startedAtIso);
+        else
+          yield* sql
+            .withTransaction(
+              Effect.gen(function* () {
+                yield* markRunning(active.id, startedAtIso);
+                // Recovery must distinguish this delivery from other windows waiting on the same task.
+                yield* sql`UPDATE scheduled_task_webhook_pending SET state = 'running' WHERE delivery_id = ${webhook.deliveryId}`;
+              }),
+            )
+            .pipe(
+              Effect.mapError((cause) =>
+                taskError("Could not start webhook run.", { taskId: task.id, cause }),
+              ),
+            );
+
         yield* notifyChanged;
 
         const fireKey =
@@ -832,8 +855,9 @@ export const layer = Layer.effect(
                   .pipe(Effect.as(ThreadId.make(active.threadId))),
               );
 
-        const completedAt = yield* localNow;
         const runSucceeded = result._tag === "Success";
+        if (webhook !== undefined && runSucceeded) yield* Ref.set(webhook.dispatched, true);
+        const completedAt = yield* localNow;
         const lastRunStatus = runSucceeded ? ("succeeded" as const) : ("failed" as const);
         const lastRunError = runSucceeded ? null : errorMessage(result.cause);
         const threadId = runSucceeded ? result.value : null;
@@ -865,11 +889,15 @@ export const layer = Layer.effect(
             yield* sql
               .withTransaction(
                 Effect.gen(function* () {
-                  yield* completion;
-                  if (runSucceeded)
-                    yield* sql`INSERT INTO scheduled_task_webhook_runs (delivery_id, task_id)
-                SELECT ${webhook.deliveryId}, ${task.id} WHERE EXISTS (SELECT 1 FROM scheduled_task_webhook_pending WHERE delivery_id = ${webhook.deliveryId})
-                ON CONFLICT DO NOTHING`;
+                  const pending =
+                    yield* sql`SELECT 1 FROM scheduled_task_webhook_pending WHERE delivery_id = ${webhook.deliveryId}`;
+                  if (pending.length === 0) yield* completion;
+                  else {
+                    const counted =
+                      yield* sql`INSERT INTO scheduled_task_webhook_runs (delivery_id, task_id)
+                      VALUES (${webhook.deliveryId}, ${task.id}) ON CONFLICT DO NOTHING RETURNING delivery_id`;
+                    if (counted.length > 0) yield* completion;
+                  }
                 }),
               )
               .pipe(
@@ -881,7 +909,7 @@ export const layer = Layer.effect(
         }
         return { task: completed, threadId };
       }).pipe(
-        Effect.onError((cause) => releaseStuckRun(task, errorMessage(cause))),
+        Effect.onError((cause) => releaseStuckRun(task, errorMessage(cause), webhook?.deliveryId)),
         Effect.ensuring(
           Ref.update(activeRuns, (active) => {
             const next = new Set(active);
@@ -958,7 +986,10 @@ export const layer = Layer.effect(
                     last_run_error = 'Run was interrupted by a server restart.',
                     next_run_at = ${nextRunAt(decoded.success, now)},
                     updated_at = ${iso(now)},
-                    run_count = run_count + 1
+                    run_count = run_count + CASE WHEN EXISTS (
+                      SELECT 1 FROM scheduled_task_webhook_pending
+                      WHERE task_id IS ${row.task_id} AND state = 'running'
+                    ) THEN 0 ELSE 1 END
                 WHERE task_id IS ${row.task_id} AND last_run_status = 'running'
               `;
               return;
@@ -972,7 +1003,10 @@ export const layer = Layer.effect(
               SET last_run_status = 'failed',
                   last_run_error = 'Run was interrupted by a server restart.',
                   updated_at = ${iso(now)},
-                  run_count = run_count + 1
+                  run_count = run_count + CASE WHEN EXISTS (
+                    SELECT 1 FROM scheduled_task_webhook_pending
+                    WHERE task_id IS ${row.task_id} AND state = 'running'
+                  ) THEN 0 ELSE 1 END
               WHERE task_id IS ${row.task_id} AND last_run_status = 'running'
             `;
           }),
@@ -1495,7 +1529,8 @@ export const layer = Layer.effect(
           Effect.annotateCurrentSpan({ "scheduled_task.webhook.run_outcome": outcome }),
           Metrics.increment(Metrics.webhookRunsTotal, { outcome }),
         ]);
-      yield* runTask(task, "webhook", { deliveryId, prompt }).pipe(
+      const dispatched = yield* Ref.make(false);
+      return yield* runTask(task, "webhook", { deliveryId, prompt, dispatched }).pipe(
         Effect.flatMap(({ task: completed }) =>
           completed.lastRunStatus === "failed"
             ? runOutcome("failed").pipe(
@@ -1511,14 +1546,23 @@ export const layer = Layer.effect(
               Effect.andThen(releaseFailedDelivery(deliveryId)),
             ),
         }),
-        // The log is readable over RPC, so it gets a fixed reason; the
-        // cause, which can carry request data, stays in the server log.
+        Effect.as(true),
+        // Dispatch success owns the replay key even if later bookkeeping fails.
         Effect.catchCause((cause) =>
-          Effect.logWarning("Webhook dispatch failed", { taskId: task.id, cause }).pipe(
-            Effect.andThen(runOutcome("failed")),
-            Effect.andThen(markDeliveryFailed(deliveryId, "The run failed to start.")),
-            Effect.andThen(releaseFailedDelivery(deliveryId)),
-          ),
+          Effect.gen(function* () {
+            const started = yield* Ref.get(dispatched);
+            yield* Effect.logWarning("Webhook dispatch failed", { taskId: task.id, cause });
+            yield* runOutcome(started ? "started" : "failed");
+            yield* markDeliveryFailed(
+              deliveryId,
+              started
+                ? "The run started, but completion could not be recorded."
+                : "The run failed to start.",
+            );
+            if (!started) yield* releaseFailedDelivery(deliveryId);
+            // Pending windows retry the same command id to finish bookkeeping.
+            return !started;
+          }),
         ),
       );
     });
@@ -1908,7 +1952,7 @@ export const layer = Layer.effect(
       const now = DateTime.toEpochMillis(yield* localNow);
       yield* sql`UPDATE scheduled_task_webhook_pending SET state = 'dispatching' WHERE state = 'pending' AND due_at <= ${now}`;
       const tasks = yield* sql<{ task_id: ScheduledTaskId }>`
-        SELECT DISTINCT task_id FROM scheduled_task_webhook_pending WHERE state = 'dispatching'
+        SELECT DISTINCT task_id FROM scheduled_task_webhook_pending WHERE state IN ('dispatching', 'running')
       `;
       yield* Effect.forEach(
         tasks,
@@ -1931,7 +1975,7 @@ export const layer = Layer.effect(
                   request_json: string;
                 }>`
               SELECT delivery_id, task_json, request_json FROM scheduled_task_webhook_pending
-              WHERE task_id = ${taskId} AND state = 'dispatching' ORDER BY due_at, rowid LIMIT 1
+              WHERE task_id = ${taskId} AND state IN ('dispatching', 'running') ORDER BY due_at, rowid LIMIT 1
             `;
                 if (entry === undefined) return;
                 const remove = sql.withTransaction(
@@ -1960,8 +2004,9 @@ export const layer = Layer.effect(
                   yield* markDeliveryFailed(entry.delivery_id, PROMPT_TOO_LONG);
                   yield* releaseFailedDelivery(entry.delivery_id);
                 } else {
-                  yield* sql`UPDATE scheduled_task_webhook_deliveries SET rendered_prompt = ${rendered.prompt}, missing_fields_json = ${encodeMissingFieldsJson(rendered.missing)} WHERE delivery_id = ${entry.delivery_id}`;
-                  yield* runWebhookDelivery(task, entry.delivery_id, rendered.prompt);
+                  yield* sql`UPDATE scheduled_task_webhook_deliveries SET outcome = 'accepted', error = NULL, rendered_prompt = ${rendered.prompt.slice(0, WEBHOOK_DELIVERY_LOG_PROMPT_LIMIT)}, missing_fields_json = ${encodeMissingFieldsJson(rendered.missing)} WHERE delivery_id = ${entry.delivery_id}`;
+                  if (!(yield* runWebhookDelivery(task, entry.delivery_id, rendered.prompt)))
+                    return;
                 }
                 yield* remove;
               }

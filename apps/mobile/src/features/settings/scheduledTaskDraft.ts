@@ -107,8 +107,9 @@ export function scheduleFromDraft(draft: ScheduleDraft): ScheduledTaskUpsertSche
   if (draft.mode === "webhook") {
     const maxDeliveryAgeMinutes = parseMaxDeliveryAge(draft.maxDeliveryAgeMinutes);
     if (maxDeliveryAgeMinutes === undefined) return null;
-    if ([draft.replayKey, draft.coalesceKey].some((key) => key && !isWebhookDedupeTemplate(key)))
-      return null;
+    const replayKey = draft.replayKey.trim();
+    const coalesceKey = draft.coalesceKey.trim();
+    if ([replayKey, coalesceKey].some((key) => key && !isWebhookDedupeTemplate(key))) return null;
     const coalesceWindowSeconds = draft.coalesceWindowSeconds?.trim()
       ? Number(draft.coalesceWindowSeconds)
       : undefined;
@@ -131,11 +132,11 @@ export function scheduleFromDraft(draft: ScheduleDraft): ScheduledTaskUpsertSche
               prefix: draft.signature.prefix,
             },
       maxDeliveryAgeMinutes,
-      ...(draft.replayKey || draft.coalesceKey || coalesceWindowSeconds !== undefined
+      ...(replayKey || coalesceKey || coalesceWindowSeconds !== undefined
         ? {
             dedupe: {
-              ...(draft.replayKey ? { replayKey: draft.replayKey } : {}),
-              ...(draft.coalesceKey ? { coalesceKey: draft.coalesceKey } : {}),
+              ...(replayKey ? { replayKey } : {}),
+              ...(coalesceKey ? { coalesceKey } : {}),
               ...(coalesceWindowSeconds === undefined ? {} : { coalesceWindowSeconds }),
             },
           }
