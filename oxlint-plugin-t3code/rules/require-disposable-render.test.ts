@@ -18,6 +18,7 @@ describe("t3code/require-disposable-render", () => {
       'it("renders", async () => {',
       "  await using screen = await render(null);",
       "  await act(() => screen.rerender(null));",
+      '  await userEvent.click(screen.getByRole("button"));',
       "});",
     ].join("\n"),
   );
@@ -39,8 +40,27 @@ describe("t3code/require-disposable-render", () => {
     "rejects stubbing the act environment",
     'vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);',
   );
+  browserTest.invalid(
+    "rejects userEvent wrapped in act from react",
+    [
+      'import { act } from "react";',
+      'it("clicks", async () => {',
+      "  await act(async () => {",
+      "    await userEvent.click(document.body);",
+      "  });",
+      "});",
+    ].join("\n"),
+  );
+  browserTest.invalid(
+    "rejects importing lifecycle hooks from the test runner",
+    'import { beforeEach, it } from "vite-plus/test";',
+  );
   browserTest.invalid("rejects afterEach", "afterEach(async () => {});");
   browserTest.invalid("rejects beforeAll", "beforeAll(() => {});");
   unitTest.valid("allows lifecycle hooks outside browser tests", "beforeEach(() => {});");
+  unitTest.valid(
+    "allows importing lifecycle hooks outside browser tests",
+    'import { afterEach } from "vite-plus/test";',
+  );
   unitTest.invalid("still rejects react-dom/client in unit tests", 'import "react-dom/client";');
 });
