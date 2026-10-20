@@ -2365,3 +2365,64 @@ it.effect(
     );
   },
 );
+
+it.effect("a full run budget still accepts replay hits and the latest open-window payload", () => {
+  const workers = new Map<string, Effect.Effect<void>>();
+  return withService(
+    ({ service, launches, sql }) =>
+      Effect.gen(function* () {
+        const { task } = yield* service.upsert(
+          yield* webhookTaskInput({
+            prompt: "{{body.value}}",
+            schedule: {
+              type: "webhook",
+              dedupe: {
+                replayKey: "{{headers.delivery-id}}",
+                coalesceKey: "{{body.group}}",
+                coalesceWindowSeconds: 10,
+              },
+            },
+          }),
+        );
+        const request = (id: string, value: string, group?: string) => {
+          const bodyText = JSON.stringify({ value, ...(group === undefined ? {} : { group }) });
+          return requestFor(task, {
+            bodyText,
+            body: new TextEncoder().encode(bodyText),
+            headers: { "delivery-id": id },
+          });
+        };
+        for (let i = 0; i < 59; i++) {
+          const result = yield* waitForSpan(
+            service.triggerWebhook(request(String(i), String(i))),
+            "ScheduledTaskService.runWebhookDelivery",
+          );
+          assert.equal(result._tag === "accepted" && result.outcome, "accepted");
+          yield* Queue.take(launches);
+        }
+        const opened = yield* service.triggerWebhook(request("B1", "old", "B"));
+        assert.equal(opened._tag === "accepted" && opened.outcome, "accepted");
+        const duplicate = yield* service.triggerWebhook(request("0", "duplicate"));
+        assert.equal(duplicate._tag === "accepted" && duplicate.outcome, "duplicate");
+        const update = yield* service.triggerWebhook(request("B2", "latest", "B"));
+        assert.equal(update._tag === "accepted" && update.outcome, "coalesced");
+        assert.equal(
+          (yield* service.triggerWebhook(request("C", "new window", "C")))._tag,
+          "rate_limited",
+        );
+        assert.equal(
+          (yield* service.triggerWebhook(request("D", "new immediate")))._tag,
+          "rate_limited",
+        );
+        assert.equal((yield* sql`SELECT 1 FROM scheduled_task_webhook_pending`).length, 1);
+        assert.equal(yield* Queue.size(launches), 0);
+        yield* TestClock.adjust("10 seconds");
+        yield* drainPendingDispatch(workers);
+        assert.include((yield* Queue.take(launches)).initialMessage!.text, "latest");
+        assert.equal(yield* Queue.size(launches), 0);
+        assert.equal((yield* service.list()).tasks[0]!.runCount, 60);
+        assert.equal((yield* sql`SELECT 1 FROM scheduled_task_webhook_pending`).length, 0);
+      }),
+    { workers },
+  );
+});
