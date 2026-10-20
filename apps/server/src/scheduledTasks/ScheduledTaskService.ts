@@ -5,7 +5,6 @@ import {
   ScheduledTask,
   ScheduledTaskError,
   ScheduledTaskId,
-  ScheduledTaskUpsertSchedule,
   ThreadId,
   ScheduledTaskWebhookDeliveryId,
   type ScheduledTaskDeleteInput,
@@ -66,10 +65,10 @@ import { constantTimeEquals, verifyWebhookSignature } from "./webhookVerificatio
 
 export const WEBHOOK_ROUTE_PREFIX = "/api/hooks";
 const isScheduledTaskError = Schema.is(ScheduledTaskError);
-const isUpsertSchedule = Schema.is(ScheduledTaskUpsertSchedule);
 const PROMPT_TOO_LONG = "The filled-in prompt is too long.";
 const WEBHOOK_DELIVERY_RETENTION = 50;
 const WEBHOOK_DEDUPE_DELIVERY_RETENTION = 20;
+const WEBHOOK_FILTERED_DELIVERY_RETENTION = 20;
 const WEBHOOK_DEDUPE_LOG_PER_MINUTE = 10;
 const WEBHOOK_DELIVERY_LOG_BODY_LIMIT = 64 * 1024;
 const WEBHOOK_DELIVERY_LOG_PROMPT_LIMIT = 64 * 1024;
@@ -678,7 +677,7 @@ export const layer = Layer.effect(
     // markCompleted, write a full terminal record so runDueTasks neither skips
     // the task forever (it filters out 'running' rows) nor re-fires it
     // immediately: the dispatch may already have gone out, so next_run_at must
-    // advance. Pending webhook attempts count only with their completion ledger;
+    // advance. Pending webhook attempts count only with their completion state;
     // other attempts count here.
     const releaseStuckRun = Effect.fn("ScheduledTaskService.releaseStuckRun")(
       function* (task: ScheduledTask, message: string, pendingDeliveryId?: string) {
@@ -754,7 +753,7 @@ export const layer = Layer.effect(
         }
         if (
           webhook !== undefined &&
-          (yield* sql`SELECT 1 FROM scheduled_task_webhook_runs WHERE delivery_id = ${webhook.deliveryId}`)
+          (yield* sql`SELECT 1 FROM scheduled_task_webhook_pending WHERE delivery_id = ${webhook.deliveryId} AND state = 'completed'`)
             .length > 0
         )
           return { task: { ...active, lastRunStatus: "succeeded" as const }, threadId: null };
@@ -894,8 +893,8 @@ export const layer = Layer.effect(
                   if (pending.length === 0) yield* completion;
                   else {
                     const counted =
-                      yield* sql`INSERT INTO scheduled_task_webhook_runs (delivery_id, task_id)
-                      VALUES (${webhook.deliveryId}, ${task.id}) ON CONFLICT DO NOTHING RETURNING delivery_id`;
+                      yield* sql`UPDATE scheduled_task_webhook_pending SET state = ${runSucceeded ? "completed" : "failed"}
+                      WHERE delivery_id = ${webhook.deliveryId} AND state NOT IN ('completed', 'failed') RETURNING delivery_id`;
                     if (counted.length > 0) yield* completion;
                   }
                 }),
@@ -1043,8 +1042,6 @@ export const layer = Layer.effect(
     const upsert: ScheduledTaskService["Service"]["upsert"] = Effect.fn(
       "ScheduledTaskService.upsert",
     )(function* (input) {
-      if (input.schedule.type === "webhook" && !isUpsertSchedule(input.schedule))
-        return yield* taskError("Invalid webhook schedule.");
       const now = yield* localNow;
       const uuid =
         input.commandId === undefined
@@ -1430,7 +1427,7 @@ export const layer = Layer.effect(
                 SELECT delivery_id FROM scheduled_task_webhook_deliveries
                 WHERE task_id = ${input.taskId} AND ${rowBucket} = ${retentionBucket}
                 ORDER BY received_at DESC, rowid DESC
-                LIMIT ${retentionBucket === "main" ? WEBHOOK_DELIVERY_RETENTION : WEBHOOK_DEDUPE_DELIVERY_RETENTION}
+                LIMIT ${retentionBucket === "main" ? WEBHOOK_DELIVERY_RETENTION : retentionBucket === "filtered" ? WEBHOOK_FILTERED_DELIVERY_RETENTION : WEBHOOK_DEDUPE_DELIVERY_RETENTION}
               )
           `;
           }),
@@ -1512,11 +1509,16 @@ export const layer = Layer.effect(
     const releaseFailedDelivery = Effect.fn("ScheduledTaskService.releaseFailedDelivery")(
       function* (deliveryId: string) {
         yield* releaseReplay(deliveryId);
+        yield* sql`DELETE FROM scheduled_task_webhook_relay_deliveries WHERE relay_delivery_id IN (
+          SELECT substr(value, ${"delivery:relay:".length + 1}) FROM scheduled_task_webhook_pending, json_each(delivery_ids_json)
+          WHERE delivery_id = ${deliveryId} AND value LIKE 'delivery:relay:%'
+        )`.pipe(Effect.mapError(dedupeError));
         if (deliveryId.startsWith("delivery:relay:"))
           yield* sql`DELETE FROM scheduled_task_webhook_relay_deliveries WHERE relay_delivery_id = ${deliveryId.slice("delivery:relay:".length)}`.pipe(
             Effect.mapError(dedupeError),
           );
       },
+      (effect) => sql.withTransaction(effect).pipe(Effect.mapError(dedupeError)),
     );
 
     const runWebhookDelivery = Effect.fn("ScheduledTaskService.runWebhookDelivery")(function* (
@@ -1559,7 +1561,21 @@ export const layer = Layer.effect(
                 ? "The run started, but completion could not be recorded."
                 : "The run failed to start.",
             );
-            if (!started) yield* releaseFailedDelivery(deliveryId);
+            if (!started) {
+              yield* sql
+                .withTransaction(
+                  Effect.gen(function* () {
+                    const counted =
+                      yield* sql`UPDATE scheduled_task_webhook_pending SET state = 'failed'
+                WHERE delivery_id = ${deliveryId} AND state = 'running' RETURNING delivery_id`;
+                    if (counted.length > 0)
+                      yield* sql`UPDATE scheduled_tasks SET run_count = run_count + 1
+                WHERE task_id = ${task.id} AND created_at = ${task.createdAt}`;
+                  }),
+                )
+                .pipe(Effect.mapError(dedupeError));
+              yield* releaseFailedDelivery(deliveryId);
+            }
             // Pending windows retry the same command id to finish bookkeeping.
             return !started;
           }),
@@ -1728,6 +1744,16 @@ export const layer = Layer.effect(
             yield* observe("rate_limited");
             return yield* releaseClaim({ _tag: "rate_limited", outcome: "rate_limited" } as const);
           }
+          const runWindow = (yield* Ref.get(webhookRateWindows)).get(task.id);
+          if (
+            (runWindow?.accepted.filter((entry) => DateTime.toEpochMillis(now) - entry.at < 60_000)
+              .length ?? 0) >= WEBHOOK_RATE_LIMIT_PER_MINUTE
+          ) {
+            if ((yield* takeRateSlot(task.id, DateTime.toEpochMillis(now))) === "first_rejected")
+              yield* log("rate_limited");
+            yield* observe("rate_limited");
+            return yield* releaseClaim({ _tag: "rate_limited", outcome: "rate_limited" } as const);
+          }
           if (!task.enabled) {
             yield* log("disabled");
             yield* observe("disabled");
@@ -1772,47 +1798,65 @@ export const layer = Layer.effect(
           const reserve = takeRateSlot(task.id, DateTime.toEpochMillis(now)).pipe(
             Effect.flatMap((slot) => (slot === "allowed" ? Effect.void : Effect.fail(slot))),
           );
+          const queueKey = `${task.id}\u0000${task.createdAt}`;
+          const checkCapacity = Effect.gen(function* () {
+            const [row] = yield* sql<{
+              count: number;
+            }>`SELECT COUNT(*) AS count FROM scheduled_task_webhook_pending
+              WHERE task_id = ${task.id} AND state IN ('pending', 'dispatching', 'running')`;
+            if (
+              (row?.count ?? 0) + ((yield* Ref.get(webhookQueued)).get(queueKey) ?? 0) >=
+              WEBHOOK_MAX_QUEUED_PER_TASK
+            )
+              return yield* Effect.fail("queue_full" as const);
+          }).pipe(
+            Effect.mapError((cause) => (cause === "queue_full" ? cause : dedupeError(cause))),
+          );
+          const admit = <A, E>(effect: Effect.Effect<A, E>) =>
+            sql.withTransaction(effect).pipe(
+              Effect.catch((cause) =>
+                cause === "first_rejected" || cause === "rejected" || cause === "queue_full"
+                  ? Effect.succeed({
+                      outcome:
+                        cause === "queue_full"
+                          ? ("queue_full" as const)
+                          : ("rate_limited" as const),
+                      log: cause === "first_rejected",
+                    })
+                  : Effect.fail(isScheduledTaskError(cause) ? cause : dedupeError(cause)),
+              ),
+            );
           const deduped =
             schedule.dedupe === undefined
               ? "run"
-              : yield* sql
-                  .withTransaction(
-                    Effect.gen(function* () {
-                      const outcome = yield* acceptWebhookDedupe(
-                        task,
-                        request,
-                        deliveryId,
-                        DateTime.toEpochMillis(now),
-                        reserve,
-                        takeDedupeLogSlot(task.id, DateTime.toEpochMillis(now)),
-                      ).pipe(Effect.provideService(SqlClient.SqlClient, sql));
-                      if (
-                        outcome === "pending" ||
-                        outcome === "coalesced" ||
-                        (outcome === "duplicate" &&
-                          (yield* takeDedupeLogSlot(task.id, DateTime.toEpochMillis(now))))
-                      )
-                        yield* log(outcome === "pending" ? "accepted" : outcome, {
-                          signatureVerified: signature !== null,
-                        });
-                      return outcome;
-                    }),
-                  )
-                  .pipe(
-                    Effect.catch((cause) =>
-                      cause === "first_rejected" || cause === "rejected"
-                        ? Effect.succeed({
-                            outcome: "rate_limited" as const,
-                            log: cause === "first_rejected",
-                          })
-                        : Effect.fail(isScheduledTaskError(cause) ? cause : dedupeError(cause)),
-                    ),
-                  );
+              : yield* admit(
+                  Effect.gen(function* () {
+                    const outcome = yield* acceptWebhookDedupe(
+                      task,
+                      request,
+                      deliveryId,
+                      DateTime.toEpochMillis(now),
+                      reserve,
+                      takeDedupeLogSlot(task.id, DateTime.toEpochMillis(now)),
+                      checkCapacity,
+                    ).pipe(Effect.provideService(SqlClient.SqlClient, sql));
+                    if (
+                      outcome === "pending" ||
+                      outcome === "coalesced" ||
+                      (outcome === "duplicate" &&
+                        (yield* takeDedupeLogSlot(task.id, DateTime.toEpochMillis(now))))
+                    )
+                      yield* log(outcome === "pending" ? "accepted" : outcome, {
+                        signatureVerified: signature !== null,
+                      });
+                    return outcome;
+                  }),
+                );
           if (typeof deduped !== "string") {
             yield* refundRejectionSlot;
             if (deduped.log) yield* log("rate_limited");
-            yield* observe("rate_limited");
-            return yield* releaseClaim({ _tag: "rate_limited", outcome: "rate_limited" } as const);
+            yield* observe(deduped.outcome);
+            return yield* releaseClaim({ _tag: "rate_limited", outcome: deduped.outcome } as const);
           }
           if (deduped !== "run") {
             if (deduped !== "coalesced" && deduped !== "coalesced_unlogged")
@@ -1854,66 +1898,56 @@ export const layer = Layer.effect(
           // Bound the deliveries one task holds, so steady traffic to a stuck
           // task cannot pile up parked fibers.
           yield* refundRejectionSlot;
-          const queueKey = `${task.id}\u0000${task.createdAt}`;
-          const queued = yield* Ref.modify(webhookQueued, (counts) => {
-            const count = counts.get(queueKey) ?? 0;
-            return count >= WEBHOOK_MAX_QUEUED_PER_TASK
-              ? ([false, counts] as const)
-              : ([true, new Map(counts).set(queueKey, count + 1)] as const);
-          });
-          if (!queued) {
-            yield* releaseReplay(deliveryId);
-            yield* observe("queue_full");
-            return yield* releaseClaim({
-              _tag: "rate_limited" as const,
-              outcome: "queue_full" as const,
+          let queueReserved = false;
+          const release = Effect.suspend(() => {
+            if (!queueReserved) return Effect.void;
+            queueReserved = false;
+            return Ref.update(webhookQueued, (counts) => {
+              const next = new Map(counts);
+              const count = (next.get(queueKey) ?? 1) - 1;
+              if (count <= 0) next.delete(queueKey);
+              else next.set(queueKey, count);
+              return next;
             });
-          }
-          const release = Ref.update(webhookQueued, (counts) => {
-            const next = new Map(counts);
-            const count = (next.get(queueKey) ?? 1) - 1;
-            if (count <= 0) next.delete(queueKey);
-            else next.set(queueKey, count);
-            return next;
           });
-          const admitted = yield* sql
-            .withTransaction(
-              Effect.gen(function* () {
-                const outcome = yield* acceptImmediateWebhookDedupe(
-                  task,
-                  request,
-                  deliveryId,
-                  DateTime.toEpochMillis(now),
-                  reserve,
-                ).pipe(Effect.provideService(SqlClient.SqlClient, sql));
-                if (outcome === "duplicate") {
-                  if (yield* takeDedupeLogSlot(task.id, DateTime.toEpochMillis(now)))
-                    yield* log("duplicate", { signatureVerified: signature !== null });
-                } else
-                  yield* log("accepted", {
-                    signatureVerified: signature !== null,
-                    missing: rendered.missing,
-                    renderedPrompt: rendered.prompt,
-                  });
-                return outcome;
-              }),
-            )
-            .pipe(
-              Effect.catch((cause) =>
-                cause === "first_rejected" || cause === "rejected"
-                  ? Effect.succeed({
-                      outcome: "rate_limited" as const,
-                      log: cause === "first_rejected",
-                    })
-                  : Effect.fail(isScheduledTaskError(cause) ? cause : dedupeError(cause)),
-              ),
-              Effect.onError(() => release),
+          // Serialize immediate reservations with persisted window admission.
+          const reserveImmediate = Effect.gen(function* () {
+            yield* checkCapacity;
+            yield* reserve;
+            yield* Ref.update(webhookQueued, (counts) =>
+              new Map(counts).set(queueKey, (counts.get(queueKey) ?? 0) + 1),
             );
+            queueReserved = true;
+          });
+          const admitted = yield* admit(
+            Effect.gen(function* () {
+              const outcome = yield* acceptImmediateWebhookDedupe(
+                task,
+                request,
+                deliveryId,
+                DateTime.toEpochMillis(now),
+                reserveImmediate,
+              ).pipe(Effect.provideService(SqlClient.SqlClient, sql));
+              if (outcome === "duplicate") {
+                if (yield* takeDedupeLogSlot(task.id, DateTime.toEpochMillis(now)))
+                  yield* log("duplicate", { signatureVerified: signature !== null });
+              } else
+                yield* log("accepted", {
+                  signatureVerified: signature !== null,
+                  missing: rendered.missing,
+                  renderedPrompt: rendered.prompt,
+                });
+              return outcome;
+            }),
+          ).pipe(Effect.onError(() => release));
           if (typeof admitted !== "string") {
             yield* release;
             if (admitted.log) yield* log("rate_limited");
-            yield* observe("rate_limited");
-            return yield* releaseClaim({ _tag: "rate_limited", outcome: "rate_limited" } as const);
+            yield* observe(admitted.outcome);
+            return yield* releaseClaim({
+              _tag: "rate_limited",
+              outcome: admitted.outcome,
+            } as const);
           }
           if (admitted === "duplicate") {
             yield* release;
@@ -1952,7 +1986,7 @@ export const layer = Layer.effect(
       const now = DateTime.toEpochMillis(yield* localNow);
       yield* sql`UPDATE scheduled_task_webhook_pending SET state = 'dispatching' WHERE state = 'pending' AND due_at <= ${now}`;
       const tasks = yield* sql<{ task_id: ScheduledTaskId }>`
-        SELECT DISTINCT task_id FROM scheduled_task_webhook_pending WHERE state IN ('dispatching', 'running')
+        SELECT DISTINCT task_id FROM scheduled_task_webhook_pending WHERE state IN ('dispatching', 'running', 'completed', 'failed')
       `;
       yield* Effect.forEach(
         tasks,
@@ -1973,17 +2007,21 @@ export const layer = Layer.effect(
                   delivery_id: string;
                   task_json: string;
                   request_json: string;
+                  state: string;
                 }>`
-              SELECT delivery_id, task_json, request_json FROM scheduled_task_webhook_pending
-              WHERE task_id = ${taskId} AND state IN ('dispatching', 'running') ORDER BY due_at, rowid LIMIT 1
+              SELECT delivery_id, task_json, request_json, state FROM scheduled_task_webhook_pending
+              WHERE task_id = ${taskId} AND state IN ('dispatching', 'running', 'completed', 'failed') ORDER BY due_at, rowid LIMIT 1
             `;
                 if (entry === undefined) return;
-                const remove = sql.withTransaction(
-                  Effect.gen(function* () {
-                    yield* sql`DELETE FROM scheduled_task_webhook_pending WHERE delivery_id = ${entry.delivery_id}`;
-                    yield* sql`DELETE FROM scheduled_task_webhook_runs WHERE delivery_id = ${entry.delivery_id}`;
-                  }),
-                );
+                const remove = sql`DELETE FROM scheduled_task_webhook_pending WHERE delivery_id = ${entry.delivery_id}`;
+                if (entry.state === "completed" || entry.state === "failed") {
+                  if (entry.state === "failed") {
+                    yield* markDeliveryFailed(entry.delivery_id, "The run failed to start.");
+                    yield* releaseFailedDelivery(entry.delivery_id);
+                  }
+                  yield* remove;
+                  continue;
+                }
                 const prepared = yield* Effect.gen(function* () {
                   const task = yield* decodePendingTask(entry.task_json);
                   const request = yield* decodePendingRequest(entry.request_json);

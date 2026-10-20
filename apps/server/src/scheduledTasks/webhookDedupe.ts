@@ -49,6 +49,7 @@ export const acceptWebhookDedupe = Effect.fn("ScheduledTaskService.acceptWebhook
   now: number,
   reserve: Effect.Effect<void, "first_rejected" | "rejected">,
   reserveCoalescedLog: Effect.Effect<boolean>,
+  checkCapacity: Effect.Effect<void, "queue_full" | ScheduledTaskError>,
 ) {
   const sql = yield* SqlClient.SqlClient;
   const dedupe = task.schedule.type === "webhook" ? task.schedule.dedupe : undefined;
@@ -62,7 +63,10 @@ export const acceptWebhookDedupe = Effect.fn("ScheduledTaskService.acceptWebhook
   }>`SELECT delivery_id FROM scheduled_task_webhook_pending
     WHERE task_id = ${task.id} AND coalesce_key = ${coalesceKey} AND state = 'pending' AND due_at > ${now}`;
   const logCoalesced = pending.length > 0 ? yield* reserveCoalescedLog : true;
-  if (pending.length === 0) yield* reserve;
+  if (pending.length === 0) {
+    yield* checkCapacity;
+    yield* reserve;
+  }
   // Coalesced requests retain their validation slot, bounding writes without dropping accepted payloads.
   yield* claimReplayKey(task.id, replayKey, pending[0]?.delivery_id ?? deliveryId, now);
   const requestJson = yield* encodePendingRequest({
@@ -73,14 +77,15 @@ export const acceptWebhookDedupe = Effect.fn("ScheduledTaskService.acceptWebhook
     bodyText: request.bodyText,
   });
   if (pending.length > 0) {
-    yield* sql`UPDATE scheduled_task_webhook_pending SET request_json = ${requestJson} WHERE delivery_id = ${pending[0]!.delivery_id}`;
+    yield* sql`UPDATE scheduled_task_webhook_pending SET request_json = ${requestJson},
+      delivery_ids_json = json_insert(delivery_ids_json, '$[#]', ${deliveryId}) WHERE delivery_id = ${pending[0]!.delivery_id}`;
     return logCoalesced ? ("coalesced" as const) : ("coalesced_unlogged" as const);
   }
   // Expired windows are immutable, even if the scheduler has not dispatched them yet.
   yield* sql`UPDATE scheduled_task_webhook_pending SET state = 'dispatching'
     WHERE task_id = ${task.id} AND coalesce_key = ${coalesceKey} AND state = 'pending' AND due_at <= ${now}`;
-  yield* sql`INSERT INTO scheduled_task_webhook_pending (delivery_id, task_id, coalesce_key, due_at, task_json, request_json)
-    VALUES (${deliveryId}, ${task.id}, ${coalesceKey}, ${now + (dedupe.coalesceWindowSeconds ?? 120) * 1000}, ${yield* encodePendingTask(task)}, ${requestJson})`;
+  yield* sql`INSERT INTO scheduled_task_webhook_pending (delivery_id, task_id, coalesce_key, due_at, task_json, request_json, delivery_ids_json)
+    VALUES (${deliveryId}, ${task.id}, ${coalesceKey}, ${now + (dedupe.coalesceWindowSeconds ?? 120) * 1000}, ${yield* encodePendingTask(task)}, ${requestJson}, json_array(${deliveryId}))`;
   return "pending" as const;
 });
 
@@ -91,7 +96,7 @@ export const acceptImmediateWebhookDedupe = Effect.fn(
   request: WebhookRequest,
   deliveryId: string,
   now: number,
-  reserve: Effect.Effect<void, "first_rejected" | "rejected">,
+  reserve: Effect.Effect<void, "first_rejected" | "rejected" | "queue_full" | ScheduledTaskError>,
 ) {
   const replayKey = key(
     task.schedule.type === "webhook" ? task.schedule.dedupe?.replayKey : undefined,
