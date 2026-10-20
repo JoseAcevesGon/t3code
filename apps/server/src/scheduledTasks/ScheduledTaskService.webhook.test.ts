@@ -5,6 +5,7 @@ import * as NodePlatformCrypto from "@effect/platform-node/NodeCrypto";
 import { assert, it } from "@effect/vitest";
 import { ScheduledTaskUpsertInput, SecretRequestError } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
+import * as Crypto from "effect/Crypto";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
@@ -149,6 +150,10 @@ const withService = <A, E>(
     readonly secretsByRef: Map<string, string>;
   }) => Effect.Effect<A, E, never>,
   options: {
+    readonly frameGate?: {
+      readonly started: Deferred.Deferred<void>;
+      readonly release: Deferred.Deferred<void>;
+    };
     readonly failLaunches?: { remaining: number };
     readonly gate?: Deferred.Deferred<void>;
     readonly gateForTask?: (input: LaunchInput) => Deferred.Deferred<void> | undefined;
@@ -161,7 +166,24 @@ const withService = <A, E>(
     const launches = yield* Queue.unbounded<LaunchInput>();
     const secretsByRef = new Map<string, string>();
     const layerDependencies = Layer.mergeAll(
-      NodePlatformCrypto.layer,
+      options.frameGate === undefined
+        ? NodePlatformCrypto.layer
+        : Layer.effect(
+            Crypto.Crypto,
+            Effect.gen(function* () {
+              const crypto = yield* Crypto.Crypto;
+              return {
+                ...crypto,
+                randomBytes: (size: number) =>
+                  size === 6
+                    ? Deferred.succeed(options.frameGate!.started, undefined).pipe(
+                        Effect.andThen(Deferred.await(options.frameGate!.release)),
+                        Effect.andThen(crypto.randomBytes(size)),
+                      )
+                    : crypto.randomBytes(size),
+              };
+            }),
+          ).pipe(Layer.provide(NodePlatformCrypto.layer)),
       options.workers === undefined
         ? Scheduler.layer
         : Layer.succeed(Scheduler.Scheduler, {
@@ -1823,4 +1845,50 @@ it.effect("main retention keeps fifty runs and preserves filtered and dedupe buc
       ]);
     }),
   ),
+);
+
+it.effect(
+  "a valid request refunds its own reservation without expiring an interleaved rejection",
+  () =>
+    Effect.gen(function* () {
+      const started = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      yield* withService(
+        ({ service, launches }) =>
+          Effect.gen(function* () {
+            const { task } = yield* service.upsert(
+              yield* webhookTaskInput({
+                schedule: {
+                  type: "webhook",
+                  signature: { header: "signature", encoding: "hex", prefix: "", secret: "secret" },
+                },
+              }),
+            );
+            const signature = NodeCrypto.createHmac("sha256", "secret")
+              .update(pullRequestBody)
+              .digest("hex");
+            const valid = yield* service
+              .triggerWebhook(requestFor(task, { headers: { signature } }))
+              .pipe(Effect.forkChild);
+            yield* Deferred.await(started);
+            yield* TestClock.adjust("30 seconds");
+            assert.equal(
+              (yield* service.triggerWebhook(requestFor(task)))._tag,
+              "rejected_signature",
+            );
+            yield* Deferred.succeed(release, undefined);
+            assert.equal((yield* Fiber.join(valid))._tag, "accepted");
+            yield* Queue.take(launches);
+            // Only the valid reservation would have expired now; the rejection must still count.
+            yield* TestClock.adjust("31 seconds");
+            for (let i = 0; i < 59; i++)
+              assert.equal(
+                (yield* service.triggerWebhook(requestFor(task)))._tag,
+                "rejected_signature",
+              );
+            assert.equal((yield* service.triggerWebhook(requestFor(task)))._tag, "rate_limited");
+          }),
+        { frameGate: { started, release } },
+      );
+    }),
 );

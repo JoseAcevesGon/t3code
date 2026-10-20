@@ -115,7 +115,7 @@ class WebhookDeliverySkipped extends Data.TaggedError("WebhookDeliverySkipped")<
 }> {}
 
 interface RateWindow {
-  readonly accepted: ReadonlyArray<number>;
+  readonly accepted: ReadonlyArray<{ readonly at: number }>;
   readonly rejectedLogged: boolean;
 }
 
@@ -1416,7 +1416,12 @@ export const layer = Layer.effect(
       `.pipe(Effect.ignore);
 
     /** Sliding one-minute window for deliveries that can start work. */
-    const takeRateSlot = (id: ScheduledTaskId, nowMs: number, rateWindows = webhookRateWindows) =>
+    const takeRateSlot = (
+      id: ScheduledTaskId,
+      nowMs: number,
+      rateWindows = webhookRateWindows,
+      reservation = { at: nowMs },
+    ) =>
       Ref.modify(
         rateWindows,
         (
@@ -1426,7 +1431,7 @@ export const layer = Layer.effect(
           ReadonlyMap<ScheduledTaskId, RateWindow>,
         ] => {
           const current = windows.get(id);
-          const recent = (current?.accepted ?? []).filter((at) => nowMs - at < 60_000);
+          const recent = (current?.accepted ?? []).filter((entry) => nowMs - entry.at < 60_000);
           if (recent.length >= WEBHOOK_RATE_LIMIT_PER_MINUTE) {
             const first = current?.rejectedLogged !== true;
             return [
@@ -1436,7 +1441,7 @@ export const layer = Layer.effect(
           }
           return [
             "allowed",
-            new Map(windows).set(id, { accepted: [...recent, nowMs], rejectedLogged: false }),
+            new Map(windows).set(id, { accepted: [...recent, reservation], rejectedLogged: false }),
           ];
         },
       );
@@ -1667,10 +1672,12 @@ export const layer = Layer.effect(
 
           // Reject floods before signature work or rejection-log writes; valid
           // deliveries give this reservation back once validation succeeds.
+          const rejectionReservation = { at: DateTime.toEpochMillis(now) };
           const rejectionSlot = yield* takeRateSlot(
             task.id,
             DateTime.toEpochMillis(now),
             webhookRejectedRateWindows,
+            rejectionReservation,
           );
           if (rejectionSlot !== "allowed") {
             if (rejectionSlot === "first_rejected") yield* log("rate_limited");
@@ -1714,7 +1721,7 @@ export const layer = Layer.effect(
             if (current === undefined) return windows;
             return new Map(windows).set(task.id, {
               ...current,
-              accepted: current.accepted.slice(0, -1),
+              accepted: current.accepted.filter((entry) => entry !== rejectionReservation),
             });
           });
 
