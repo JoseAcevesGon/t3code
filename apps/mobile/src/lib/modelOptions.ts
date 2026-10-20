@@ -267,6 +267,7 @@ export function buildModelOptions(
   };
   const badgeEntries = (config?.providers ?? []).map((provider) => ({
     driverKind: provider.driver,
+    enabled: provider.enabled,
     acpRegistryAgentId: registryAgentId(provider.instanceId),
   }));
   const providerBadgeFor = (instanceId: ModelSelection["instanceId"]) => {
@@ -285,7 +286,12 @@ export function buildModelOptions(
       }),
       ...(accentColor ? { accentColor } : {}),
       showBadge: shouldShowInstanceBadge(
-        { driverKind: driver, accentColor, acpRegistryAgentId: registryAgentId(instanceId) },
+        {
+          driverKind: driver,
+          accentColor,
+          acpRegistryAgentId: registryAgentId(instanceId),
+          enabled: snapshot?.enabled ?? instance?.enabled ?? false,
+        },
         badgeEntries,
       ),
     };

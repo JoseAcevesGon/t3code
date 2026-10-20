@@ -10,14 +10,12 @@ import {
   getProviderOptionCurrentValue,
   isClaudeUltrathinkPrompt,
 } from "@t3tools/shared/model";
+import { REASONING_EFFORT_OPTION_IDS } from "./state/threadExecution";
 
 export const ULTRATHINK_PROMPT_PREFIX = "Ultrathink:\n";
 
 export const REASONING_SELECT_DESCRIPTOR_IDS: ReadonlySet<string> = new Set([
-  "reasoningEffort",
-  "reasoning",
-  "effort",
-  "variant",
+  ...REASONING_EFFORT_OPTION_IDS,
   "thinking",
 ]);
 
