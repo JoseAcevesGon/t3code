@@ -29,7 +29,7 @@ import * as ScheduledTaskService from "./ScheduledTaskService.ts";
 const decodeUpsertInput = Schema.decodeUnknownEffect(ScheduledTaskUpsertInput);
 
 it.effect(
-  "preserves omitted dedupe settings and releases replay/coalesce relay claims without using rate slots",
+  "preserves omitted dedupe settings, releases duplicate claims, and retains coalesced claims",
   () =>
     withService(({ service, sql, launches }) =>
       Effect.gen(function* () {
@@ -64,7 +64,13 @@ it.effect(
           );
           assert.equal(coalesced._tag === "accepted" && coalesced.outcome, "coalesced");
         }
-        assert.equal((yield* sql`SELECT * FROM scheduled_task_webhook_relay_deliveries`).length, 0);
+        const claims = yield* sql<{
+          relay_delivery_id: string;
+        }>`SELECT relay_delivery_id FROM scheduled_task_webhook_relay_deliveries ORDER BY relay_delivery_id`;
+        assert.deepEqual(
+          claims.map((claim) => claim.relay_delivery_id),
+          Array.from({ length: 5 }, (_, i) => `coalesced-${i}`),
+        );
         assert.isTrue(
           (yield* service.listWebhookDeliveries({ id: task.id })).deliveries.every(
             (delivery) => delivery.outcome !== "duplicate" && delivery.outcome !== "coalesced",
@@ -2059,3 +2065,82 @@ it.effect("retries coalesced completion bookkeeping without launching or countin
     { workers, completedLaunches: new Set() },
   );
 });
+
+it.effect("propagates coalescing log failures with their task id and rolls back acceptance", () => {
+  const workers = new Map<string, Effect.Effect<void>>();
+  return withService(
+    ({ service, sql, launches }) =>
+      Effect.gen(function* () {
+        const { task } = yield* service.upsert(
+          yield* webhookTaskInput({
+            schedule: {
+              type: "webhook",
+              dedupe: { replayKey: "{{body}}", coalesceKey: "{{body}}", coalesceWindowSeconds: 10 },
+            },
+          }),
+        );
+        const request = requestFor(task, { relayDeliveryId: "coalescing-log-failure" });
+        yield* sql`CREATE TRIGGER fail_coalescing_log BEFORE INSERT ON scheduled_task_webhook_deliveries
+      BEGIN SELECT RAISE(FAIL, 'injected coalescing log failure'); END`;
+        const error = yield* service.triggerWebhook(request).pipe(Effect.flip);
+        assert.equal(error.message, "Could not record webhook delivery.");
+        assert.equal(error.taskId, task.id);
+        assert.equal((yield* sql`SELECT 1 FROM scheduled_task_webhook_pending`).length, 0);
+        assert.equal((yield* sql`SELECT 1 FROM scheduled_task_webhook_replay_keys`).length, 0);
+        assert.equal((yield* sql`SELECT 1 FROM scheduled_task_webhook_relay_deliveries`).length, 0);
+        yield* sql`DROP TRIGGER fail_coalescing_log`;
+        assert.equal((yield* service.triggerWebhook(request))._tag, "accepted");
+        yield* TestClock.adjust("10 seconds");
+        yield* drainPendingDispatch(workers);
+        yield* Queue.take(launches);
+      }),
+    { workers },
+  );
+});
+
+it.effect.each([1, 11])(
+  "keeps relay claims for %i coalesced updates after their window closes",
+  (count) => {
+    const workers = new Map<string, Effect.Effect<void>>();
+    return withService(
+      ({ service, sql, launches }) =>
+        Effect.gen(function* () {
+          const { task } = yield* service.upsert(
+            yield* webhookTaskInput({
+              prompt: "{{body.value}}",
+              schedule: {
+                type: "webhook",
+                dedupe: { coalesceKey: "{{body.group}}", coalesceWindowSeconds: 10 },
+              },
+            }),
+          );
+          const request = (value: number) => {
+            const bodyText = JSON.stringify({ group: "B", value });
+            return requestFor(task, {
+              relayDeliveryId: `coalesced-relay-${value}`,
+              bodyText,
+              body: new TextEncoder().encode(bodyText),
+            });
+          };
+          yield* service.triggerWebhook(request(0));
+          for (let i = 1; i <= count; i++) {
+            const result = yield* service.triggerWebhook(request(i));
+            assert.equal(result._tag === "accepted" && result.outcome, "coalesced");
+          }
+          assert.equal(
+            (yield* sql`SELECT 1 FROM scheduled_task_webhook_relay_deliveries`).length,
+            count + 1,
+          );
+          yield* TestClock.adjust("10 seconds");
+          yield* drainPendingDispatch(workers);
+          assert.include((yield* Queue.take(launches)).initialMessage!.text, `>${count}<`);
+          const retry = yield* service.triggerWebhook(request(count));
+          assert.equal(retry._tag === "accepted" && retry.outcome, "duplicate");
+          assert.equal((yield* sql`SELECT 1 FROM scheduled_task_webhook_pending`).length, 0);
+          assert.equal((yield* service.list()).tasks[0]!.runCount, 1);
+          assert.equal(yield* Queue.size(launches), 0);
+        }),
+      { workers },
+    );
+  },
+);

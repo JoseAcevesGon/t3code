@@ -1805,7 +1805,7 @@ export const layer = Layer.effect(
                             outcome: "rate_limited" as const,
                             log: cause === "first_rejected",
                           })
-                        : Effect.fail(dedupeError(cause)),
+                        : Effect.fail(isScheduledTaskError(cause) ? cause : dedupeError(cause)),
                     ),
                   );
           if (typeof deduped !== "string") {
@@ -1824,7 +1824,7 @@ export const layer = Layer.effect(
                   ? "coalesced"
                   : deduped;
             yield* observe(outcome);
-            if (deduped !== "pending")
+            if (deduped === "duplicate")
               return yield* releaseClaim({ _tag: "accepted", deliveryId, outcome } as const);
             claimAcquired = false;
             return { _tag: "accepted", deliveryId, outcome } as const;
