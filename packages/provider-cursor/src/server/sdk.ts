@@ -13,6 +13,8 @@ export const {
   CursorSdkError,
   InMemoryCredentialStore,
 } = requireCursorSdk("@cursor/sdk") as typeof import("@cursor/sdk");
+Cursor.configure({ local: { useHttp1ForAgent: true } });
+
 export const { SqliteLocalAgentStore } = requireCursorSdk(
   "@cursor/sdk/sqlite",
 ) as typeof import("@cursor/sdk/sqlite");
