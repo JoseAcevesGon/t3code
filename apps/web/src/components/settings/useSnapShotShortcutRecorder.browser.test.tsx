@@ -52,12 +52,12 @@ async function renderRecorder(props: Parameters<typeof Recorder>[0] = {}) {
     ...screen,
     button,
     async start() {
-      await act(() => userEvent.click(button()));
+      await userEvent.click(button());
       expect(recording).toBe(true);
     },
   };
 }
-const press = (keys: string) => act(async () => userEvent.keyboard(keys));
+const press = (keys: string) => userEvent.keyboard(keys);
 
 it("suppresses capture while recording and uses the physical key for shifted digits", async () => {
   setup();
@@ -88,7 +88,7 @@ it("lets users replace an unrecognized desktop label without displaying guessed 
   const { button } = screen;
   expect(button().textContent).toBe("Change shortcut");
   expect(button().getAttribute("aria-label")).toBe("Change snapshot shortcut");
-  await act(async () => userEvent.click(button()));
+  await userEvent.click(button());
   expect(button().textContent).toBe("Press shortcut…");
   await press("{Control>}{Shift>}2{/Shift}{/Control}");
   expect(recorded).toHaveBeenCalledWith(
@@ -134,7 +134,7 @@ it("ignores late suppression acknowledgements after cancellation", async () => {
   suppress.mockImplementation((enabled) => (enabled ? pending.promise : Promise.resolve()));
   await using screen = await renderRecorder();
   const { button } = screen;
-  await act(async () => userEvent.click(button()));
+  await userEvent.click(button());
   await act(async () => button().blur());
   await act(async () => pending.resolve());
   expect(recording).toBe(false);
@@ -148,7 +148,7 @@ it("reports suppression failures instead of arming the recorder", async () => {
   suppress.mockRejectedValue(new Error("Couldn't pause capture"));
   await using screen = await renderRecorder();
   const { button } = screen;
-  await act(async () => userEvent.click(button()));
+  await userEvent.click(button());
   expect(recording).toBe(false);
   expect(error).toHaveBeenCalledWith("Couldn't pause capture");
 });

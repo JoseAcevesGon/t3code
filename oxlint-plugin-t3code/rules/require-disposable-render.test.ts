@@ -19,6 +19,7 @@ describe("t3code/require-disposable-render", () => {
       "  await using screen = await render(null);",
       "  await act(() => screen.rerender(null));",
       '  await userEvent.click(screen.getByRole("button"));',
+      "  await act(() => store.setState({ open: true }));",
       "});",
     ].join("\n"),
   );
@@ -46,6 +47,26 @@ describe("t3code/require-disposable-render", () => {
       'import { act } from "react";',
       'it("clicks", async () => {',
       "  await act(async () => {",
+      "    await userEvent.click(document.body);",
+      "  });",
+      "});",
+    ].join("\n"),
+  );
+  browserTest.invalid(
+    "rejects userEvent wrapped in the render helper's act",
+    [
+      'import { act } from "../../test/render";',
+      'it("types", async () => {',
+      '  await act(() => userEvent.type(document.body, "a"));',
+      "});",
+    ].join("\n"),
+  );
+  browserTest.invalid(
+    "rejects userEvent wrapped in a renamed render helper act",
+    [
+      'import { act as flush } from "../test/render.tsx";',
+      'it("clicks", async () => {',
+      "  await flush(async () => {",
       "    await userEvent.click(document.body);",
       "  });",
       "});",
