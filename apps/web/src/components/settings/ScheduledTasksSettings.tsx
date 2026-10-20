@@ -175,6 +175,7 @@ function WebhookFiltersField({
           </p>
         </div>
         <Button
+          className="shrink-0"
           variant="outline"
           size="sm"
           disabled={filters.length >= MAX_WEBHOOK_FILTERS}
@@ -185,52 +186,19 @@ function WebhookFiltersField({
         </Button>
       </div>
       {filters.map((filter, index) => (
+        // Below md the row stacks: path and remove on one line, test and value on the next.
         // Rows have no identity of their own; removing one re-renders the rest in order.
         // oxlint-disable-next-line react/no-array-index-key
-        <div key={index} className="flex items-center gap-2">
+        <div key={index} className="flex flex-wrap items-center gap-2 md:flex-nowrap">
           <Input
             aria-label={`Filter ${index + 1} path`}
-            className="min-w-0 flex-1"
+            className="min-w-0 flex-1 md:flex-4"
             placeholder="body.action"
             value={filter.path}
             onChange={(event) => update(index, { path: event.target.value })}
           />
-          <Select
-            value={filter.op}
-            onValueChange={(op) => {
-              const known = WEBHOOK_FILTER_OPS.find((option) => option.op === op);
-              if (known) update(index, { op: known.op });
-            }}
-          >
-            <SelectTrigger
-              size="sm"
-              className="w-36 shrink-0"
-              aria-label={`Filter ${index + 1} test`}
-            >
-              <SelectValue>
-                {WEBHOOK_FILTER_OPS.find((option) => option.op === filter.op)?.label}
-              </SelectValue>
-            </SelectTrigger>
-            <SelectPopup>
-              {WEBHOOK_FILTER_OPS.map((option) => (
-                <SelectItem key={option.op} value={option.op}>
-                  {option.label}
-                </SelectItem>
-              ))}
-            </SelectPopup>
-          </Select>
-          {filter.op === "exists" ? (
-            <div className="min-w-0 flex-1" />
-          ) : (
-            <Input
-              aria-label={`Filter ${index + 1} value`}
-              className="min-w-0 flex-1"
-              placeholder={filter.op === "in" ? "opened, reopened" : "opened"}
-              value={filter.value}
-              onChange={(event) => update(index, { value: event.target.value })}
-            />
-          )}
           <Button
+            className="md:order-last"
             variant="ghost"
             size="icon-sm"
             aria-label={`Remove filter ${index + 1}`}
@@ -238,6 +206,43 @@ function WebhookFiltersField({
           >
             <Trash2Icon />
           </Button>
+          <div className="flex w-full min-w-0 items-center gap-2 md:contents">
+            <Select
+              value={filter.op}
+              onValueChange={(op) => {
+                const known = WEBHOOK_FILTER_OPS.find((option) => option.op === op);
+                if (known) update(index, { op: known.op });
+              }}
+            >
+              <SelectTrigger
+                size="sm"
+                className="w-40 shrink-0"
+                aria-label={`Filter ${index + 1} test`}
+              >
+                <SelectValue>
+                  {WEBHOOK_FILTER_OPS.find((option) => option.op === filter.op)?.label}
+                </SelectValue>
+              </SelectTrigger>
+              <SelectPopup>
+                {WEBHOOK_FILTER_OPS.map((option) => (
+                  <SelectItem key={option.op} value={option.op}>
+                    {option.label}
+                  </SelectItem>
+                ))}
+              </SelectPopup>
+            </Select>
+            {filter.op === "exists" ? (
+              <div className="min-w-0 flex-1 md:flex-3" />
+            ) : (
+              <Input
+                aria-label={`Filter ${index + 1} value`}
+                className="min-w-0 flex-1 md:flex-3"
+                placeholder={filter.op === "in" ? "opened, reopened" : "opened"}
+                value={filter.value}
+                onChange={(event) => update(index, { value: event.target.value })}
+              />
+            )}
+          </div>
         </div>
       ))}
     </div>
