@@ -9,7 +9,9 @@ let sqlite: typeof import("@cursor/sdk/sqlite") | undefined;
 export function loadCursorSdk(): typeof import("@cursor/sdk") {
   if (sdk !== undefined) return sdk;
   const start = performance.now();
-  sdk = requireCursorSdk("@cursor/sdk") as typeof import("@cursor/sdk");
+  const loaded = requireCursorSdk("@cursor/sdk") as typeof import("@cursor/sdk");
+  loaded.Cursor.configure({ local: { useHttp1ForAgent: true } });
+  sdk = loaded;
   if (process.env.T3CODE_STARTUP_PROFILE_DIR) {
     performance.measure("provider.cursor.importSdk", { start });
   }

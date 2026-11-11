@@ -4,6 +4,7 @@ const fixture = vi.hoisted(() => {
   // @effect-diagnostics-next-line extendsNativeError:off - stands in for the Cursor SDK's native Error classes.
   class SdkError extends Error {}
   const sdk = {
+    Cursor: { configure: vi.fn() },
     CursorSdkError: SdkError,
     AuthenticationError: SdkError,
     ConfigurationError: SdkError,
@@ -19,6 +20,7 @@ describe("Cursor disk modules", () => {
   it("loads on demand, shares exports across callers, and leaves SQLite unloaded", async () => {
     vi.resetModules();
     fixture.requireSdk.mockClear();
+    fixture.sdk.Cursor.configure.mockClear();
     const sdk = await import("./sdk.ts");
     expect(fixture.requireSdk).not.toHaveBeenCalled();
     expect(sdk.isCursorSdkError(new Error("unloaded"), "CursorSdkError")).toBe(false);
@@ -29,6 +31,9 @@ describe("Cursor disk modules", () => {
     expect(modules).toEqual([fixture.sdk, fixture.sdk]);
     expect(modules[0]).toBe(modules[1]);
     expect(fixture.requireSdk.mock.calls).toEqual([["@cursor/sdk"]]);
+    expect(fixture.sdk.Cursor.configure.mock.calls).toEqual([
+      [{ local: { useHttp1ForAgent: true } }],
+    ]);
     expect(
       sdk.isCursorSdkError(new fixture.sdk.CursorSdkError("same class"), "CursorSdkError"),
     ).toBe(true);
